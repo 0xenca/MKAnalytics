@@ -1,0 +1,4 @@
+-r requirements.txt
+pytest>=8
+pyflakes>=3
+playwright>=1.40   # solo para tests/test_e2e.py (luego: playwright install chromium)

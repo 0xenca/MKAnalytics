@@ -35,7 +35,6 @@ import signal
 import socket
 import statistics
 import struct
-import sys
 import threading
 import time
 import uuid
@@ -1774,6 +1773,11 @@ def _covered(q, first, last):
     return (q.t0 is None or first >= q.t0) and (q.t1 is None or last <= q.t1)
 
 
+def _cacheable(q, item):
+    first, last, src = item
+    return not isinstance(src, list) and _covered(q, first, last)
+
+
 def _known_count(q, item):
     first, last, src = item
     if isinstance(src, list) or not _covered(q, first, last):
@@ -1795,16 +1799,17 @@ def _count_source(store, q, item):
 
 def count_matches(store, q, deadline=None):
     """(nº de coincidencias, exacto). Con `deadline`, deja sin contar lo que no dé tiempo."""
-    total, exact, scanned = 0, True, 0
+    total, exact, progress = 0, True, 0
     for group in store.snapshot(q.t0, q.t1):
         for item in group:
             n = _known_count(q, item)
             if n is None:
-                if deadline is not None and scanned and time.monotonic() > deadline:
+                cacheable = _cacheable(q, item)
+                if deadline is not None and cacheable and progress and time.monotonic() > deadline:
                     exact = False
                     continue
                 n = _count_source(store, q, item)
-                scanned += 1
+                progress += cacheable
             total += n
     return total, exact
 
@@ -1819,17 +1824,20 @@ def query_page(store, q, page, size, desc, budget=LOGS_BUDGET):
     if desc:
         groups.reverse()
     lo, hi = (page - 1) * size, page * size
-    offset, rows, exact, scanned = 0, [], True, 0
+    offset, rows, exact, progress = 0, [], True, 0
     for group in groups:
         counts = [_known_count(q, it) for it in group]
         n = None if None in counts else sum(counts)
         if n is not None and not (offset < hi and offset + n > lo):
             offset += n                       # ni se abre: solo suma
             continue
-        if scanned and time.monotonic() > deadline:
+        # Solo cuenta como avance leer algo que queda en caché: el segmento activo y los bordes
+        # de la ventana se releen en cada petición y no deben agotar el turno de los demás.
+        cacheable = n is None and any(_cacheable(q, it) for it in group)
+        if cacheable and progress and time.monotonic() > deadline:
             exact = False
             break
-        scanned += 1
+        progress += cacheable
         if n is None:
             n = sum(_count_source(store, q, it) for it in group)
         if offset < hi and offset + n > lo:
