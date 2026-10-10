@@ -258,3 +258,9 @@ input.bad { border-color: var(--danger) !important; }
 .form label span { display: block; }
 .form select { width: 100%; min-width: 0; }
 .card td a { color: inherit; text-decoration: none; }
+.counting { color: var(--muted); font-style: italic; }
+.counting::before {
+  content: ""; display: inline-block; width: 9px; height: 9px; margin: 0 5px 0 4px; vertical-align: -1px;
+  border: 2px solid currentColor; border-right-color: transparent; border-radius: 50%;
+  animation: spin .7s linear infinite;
+}

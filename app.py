@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import gzip
+import hashlib
 import heapq
 import hmac
 import ipaddress
@@ -33,13 +34,19 @@ import shutil
 import signal
 import socket
 import statistics
+import struct
 import sys
 import threading
 import time
 import uuid
-from collections import Counter, defaultdict, deque
+from collections import Counter, OrderedDict, deque
 from datetime import datetime
 from functools import lru_cache
+
+try:                       # opcional: decodifica JSON varias veces más rápido
+    from orjson import loads as _loads
+except ImportError:
+    _loads = json.loads
 
 from flask import Flask, Response, jsonify, request, send_file, send_from_directory
 from werkzeug.exceptions import HTTPException
@@ -559,6 +566,7 @@ class Store:
         self.guard_freed = 0
         self._seg_cache = None
         self._compress_evt = threading.Event()
+        self.compact_state = None          # progreso de la última compactación (o None)
         self.counters = dict(received=0, stored=0, dropped_rule=0, invalid=0, paused=0,
                              paused_disk=0, rotations=0, since=time.time())
         self.listener = dict(host=None, port=None, running=False, error=None)
@@ -567,6 +575,7 @@ class Store:
 
         self.cfg = self._load_cfg()
         self._compile_rules()
+        self._recover_compaction()
         for n in os.listdir(self.logs_dir):          # restos de operaciones interrumpidas
             if n.endswith(".tmp"):
                 try:
@@ -641,6 +650,10 @@ class Store:
         with self.lock:
             return [p for _, p in self._hide]
 
+    def hide_rules(self):
+        with self.lock:
+            return list(self._hide)
+
     def hl_rules(self):
         with self.lock:
             return list(self._hl)
@@ -698,18 +711,38 @@ class Store:
         self.save_cfg()
 
     def rule_counts(self, hours=24):
-        """Coincidencias por regla en las últimas `hours` horas (no en todo el histórico)."""
+        """Coincidencias por regla en las últimas `hours` horas (no en todo el histórico).
+        Los segmentos rotados que caen enteros en la ventana se cuentan una vez (caché)."""
         with self.lock:
             rules = list(self.cfg["rules"])
         preds = [(r["id"], compile_rule(r)) for r in rules]
+        sig = json.dumps([(r["id"], r.get("match"), r["conditions"]) for r in rules],
+                         sort_keys=True, default=str)
         out = {rid: 0 for rid, _ in preds}
         t0 = time.time() - hours * 3600
-        for e in self.iter_entries(t0):
-            if e["ts"] < t0:
-                continue
-            for rid, p in preds:
-                if p(e):
-                    out[rid] += 1
+
+        def count(entries):
+            c = dict.fromkeys(out, 0)
+            for e in entries:
+                if e["ts"] < t0:
+                    continue
+                for rid, p in preds:
+                    if p(e):
+                        c[rid] += 1
+            return c
+
+        for group in self.snapshot(t0):
+            for first, last, src in group:
+                if isinstance(src, list) or first < t0:
+                    c = count(self.read_source(src))
+                else:
+                    key = (_seg_key(src), sig)
+                    c = RULES_CACHE.get(key)
+                    if c is None:
+                        c = count(self._read_segment(src))
+                        RULES_CACHE.put(key, c, len(c) + 1)
+                for rid, v in c.items():
+                    out[rid] += v
         return out
 
     # -- segmentos -----------------------------------------------------------
@@ -781,15 +814,17 @@ class Store:
         return seg.count
 
     @staticmethod
-    def _read_segment(seg):
+    def _read_segment(seg, keep=None):
+        """Entradas del segmento en orden de archivo. `keep(línea)` es un prefiltro barato sobre
+        el texto: las líneas que descarta no se llegan a decodificar."""
         opener = gzip.open if seg.gz else open
         try:
             with opener(seg.path, "rt", encoding="utf-8", errors="replace") as f:
                 for line in f:
-                    if len(line) < 3:
+                    if len(line) < 3 or (keep is not None and not keep(line)):
                         continue
                     try:
-                        e = json.loads(line)
+                        e = _loads(line)
                     except ValueError:
                         continue
                     if isinstance(e, dict) and "ts" in e:
@@ -799,9 +834,14 @@ class Store:
         except (OSError, EOFError) as ex:
             log.warning("Segmento ilegible o truncado %s: %s", seg.path, ex)
 
-    def iter_entries(self, t0=None, t1=None):
-        """Entradas en orden cronológico, leyendo del disco solo los segmentos del rango.
-        Memoria constante: nunca carga el histórico entero."""
+    def read_source(self, src, keep=None):
+        """Una fuente es un Segment rotado o la lista (foto) del segmento activo."""
+        return iter(src) if isinstance(src, list) else self._read_segment(src, keep)
+
+    def snapshot(self, t0=None, t1=None):
+        """Fuentes que tocan [t0, t1] agrupadas en orden cronológico: [[(first, last, src), ...]].
+        Dentro de un grupo las fuentes se solapan en fechas (importaciones) y hay que mezclarlas;
+        grupos distintos no se solapan, así que se pueden recorrer uno a uno en cualquier sentido."""
         with self.lock:                      # foto consistente aunque rote a la vez
             cur = list(self.cur)
             segs = self.segments()
@@ -809,26 +849,35 @@ class Store:
         for s in segs:
             if (t0 is not None and s.last < t0) or (t1 is not None and s.first > t1):
                 continue
-            items.append((s.first, s.last, (lambda s=s: self._read_segment(s))))
+            items.append((s.first, s.last, s))
         if cur:
             cf, cl = int(cur[0]["ts"]), int(cur[-1]["ts"]) + 1
             if not ((t0 is not None and cl < t0) or (t1 is not None and cf > t1)):
-                items.append((cf, cl, (lambda: iter(cur))))
+                items.append((cf, cl, cur))
         items.sort(key=lambda x: x[0])
+        groups, gmax = [], None
+        for it in items:
+            if groups and it[0] < gmax:
+                groups[-1].append(it)
+                gmax = max(gmax, it[1])
+            else:
+                groups.append([it])
+                gmax = it[1]
+        return groups
 
-        def emit(group):
-            its = [f() for _, _, f in group]
-            return its[0] if len(its) == 1 else heapq.merge(*its, key=_ts_key)
+    def iter_group(self, group, keep=None, match=None):
+        """Entradas de un grupo en orden cronológico (mezcla por fecha si hay varias fuentes)."""
+        its = []
+        for _, _, src in group:
+            it = self.read_source(src, keep)
+            its.append(it if match is None else filter(match, it))
+        return its[0] if len(its) == 1 else heapq.merge(*its, key=_ts_key)
 
-        group, gmax = [], None
-        for it in items:               # segmentos que se solapan (importaciones) se mezclan por fecha
-            if group and it[0] >= gmax:
-                yield from emit(group)
-                group, gmax = [], None
-            group.append(it)
-            gmax = it[1] if gmax is None else max(gmax, it[1])
-        if group:
-            yield from emit(group)
+    def iter_entries(self, t0=None, t1=None):
+        """Entradas en orden cronológico, leyendo del disco solo los segmentos del rango.
+        Memoria constante: nunca carga el histórico entero."""
+        for group in self.snapshot(t0, t1):
+            yield from self.iter_group(group)
 
     def bounds(self):
         info = self._seg_info()
@@ -1037,6 +1086,168 @@ class Store:
                 os.remove(p)
             except OSError:
                 pass
+
+    # -- compactación de segmentos rotados -----------------------------------
+    # Tras borrados por filtro, cambios de ajustes o rotaciones manuales quedan segmentos
+    # diminutos. Compactar fusiona los consecutivos hasta el tamaño/antigüedad de rotación.
+    # Cada lote se escribe a un temporal y se publica con un diario (compact.journal) para que
+    # un corte a mitad no deje duplicados: al arrancar se termina de borrar lo que faltara.
+    COMPACT_SLACK = 60   # s de tolerancia en la duración (la rotación por horas se comprueba cada 10 s)
+
+    def _journal_path(self):
+        return os.path.join(self.logs_dir, "compact.journal")
+
+    def _remove_names(self, names, keep):
+        for n in names:
+            for p in (n, n[:-3] if n.endswith(".gz") else n + ".gz"):
+                if p == keep:
+                    continue
+                try:
+                    os.remove(os.path.join(self.logs_dir, p))
+                except OSError:
+                    pass
+
+    def _recover_compaction(self):
+        jp = self._journal_path()
+        if not os.path.exists(jp):
+            return
+        try:
+            with open(jp, "r", encoding="utf-8") as f:
+                d = json.load(f)
+            if os.path.exists(os.path.join(self.logs_dir, d["final"])):
+                self._remove_names(d["members"], d["final"])
+                log.warning("Compactación interrumpida completada al arrancar (%s)", d["final"])
+        except Exception as ex:
+            log.error("Diario de compactación ilegible: %s", ex)
+        try:
+            os.remove(jp)
+        except OSError:
+            pass
+
+    @staticmethod
+    def _plain_size(seg):
+        """Tamaño descomprimido (gzip lo guarda en sus 4 últimos bytes, módulo 4 GiB)."""
+        if not seg.gz:
+            return seg.size
+        try:
+            with open(seg.path, "rb") as f:
+                f.seek(-4, os.SEEK_END)
+                return max(struct.unpack("<I", f.read(4))[0], seg.size)
+        except (OSError, struct.error):
+            return seg.size * 10
+
+    def compact_plan(self):
+        """Lotes de segmentos consecutivos que caben juntos en un segmento estándar."""
+        st = self.cfg["settings"]
+        limit = st["rotate_size_mb"] * 1048576
+        span = st["rotate_hours"] * 3600
+        batches, cur = [], []
+        size = lo = hi = 0
+        for seg in self.segments():
+            ps = self._plain_size(seg)
+            if cur and size + ps <= limit and \
+                    (not span or max(hi, seg.last) - min(lo, seg.first) <= span + self.COMPACT_SLACK):
+                cur.append(seg)
+                size, lo, hi = size + ps, min(lo, seg.first), max(hi, seg.last)
+                continue
+            if len(cur) > 1:
+                batches.append(cur)
+            cur, size, lo, hi = [seg], ps, seg.first, seg.last
+        if len(cur) > 1:
+            batches.append(cur)
+        return batches
+
+    def _merge_segments(self, batch):
+        """Fusiona `batch` en un único segmento. Requiere seg_lock. Devuelve el nombre nuevo."""
+        gz = self.cfg["settings"]["compress_rotated"]
+        tmp = os.path.join(self.logs_dir, "compact-%s.tmp" % uuid.uuid4().hex[:8])
+        n = last_id = 0
+        lo = hi = None
+        try:
+            with open(tmp, "wb") as raw:
+                fo = gzip.GzipFile(fileobj=raw, mode="wb", compresslevel=6) if gz else raw
+                buf = []
+                for e in heapq.merge(*(self._read_segment(s) for s in batch), key=_ts_key):
+                    buf.append(_dumps(e))
+                    n += 1
+                    ts = e["ts"]
+                    lo = ts if lo is None or ts < lo else lo
+                    hi = ts if hi is None or ts > hi else hi
+                    i = e.get("id")
+                    if isinstance(i, int) and i > last_id:
+                        last_id = i
+                    if len(buf) >= 4096:
+                        fo.write(("\n".join(buf) + "\n").encode("utf-8"))
+                        buf = []
+                if buf:
+                    fo.write(("\n".join(buf) + "\n").encode("utf-8"))
+                if gz:
+                    fo.close()
+                raw.flush()
+                os.fsync(raw.fileno())
+        except BaseException:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+            raise
+        members = [s.name for s in batch]
+        if n == 0:
+            os.remove(tmp)
+            self._remove_names(members, None)
+            return None
+        name = _seg_filename(lo, hi, last_id, n, gz)
+        jp = self._journal_path()
+        with open(jp, "w", encoding="utf-8") as f:
+            json.dump({"final": name, "members": members}, f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, os.path.join(self.logs_dir, name))
+        self._remove_names(members, name)
+        os.remove(jp)
+        return name
+
+    def start_compaction(self):
+        with self.seg_lock:
+            if self.compact_state and self.compact_state.get("running"):
+                raise ValueError("Ya hay una compactación en curso")
+            batches = self.compact_plan()
+            n_in = sum(len(b) for b in batches)
+            self.compact_state = dict(running=bool(batches), total=len(batches), done=0,
+                                      segments_in=n_in, segments_out=0, error=None,
+                                      started=time.time(), finished=None if batches else time.time())
+        if batches:
+            threading.Thread(target=self._compact_run, args=(batches,), daemon=True,
+                             name="compact").start()
+        return dict(self.compact_state)
+
+    def _compact_run(self, batches):
+        st = self.compact_state
+        try:
+            for batch in batches:
+                pct = self.cfg["settings"]["min_free_percent"]
+                d = self.disk_info()
+                if pct and d and d["free_pct"] < pct:
+                    st["error"] = "Detenida: poco espacio libre en disco"
+                    break
+                with self.seg_lock:
+                    live = {x.name for x in self.segments()}
+                    if all(x.name in live for x in batch):  # nadie los ha borrado/reescrito
+                        if self._merge_segments(batch):
+                            st["segments_out"] += 1
+                        self._invalidate()
+                    else:
+                        st["segments_out"] += sum(1 for x in batch if x.name in live)
+                st["done"] += 1
+            log.info("Compactación: %d segmentos -> %d", st["segments_in"], st["segments_out"])
+        except Exception as ex:
+            st["error"] = str(ex)
+            log.error("Error compactando segmentos: %s", ex)
+        finally:
+            self._invalidate()
+            self._compress_evt.set()
+            st["running"] = False
+            st["finished"] = time.time()
 
     # -- espacio en disco ----------------------------------------------------
     def disk_info(self):
@@ -1338,6 +1549,7 @@ class Store:
                 },
                 "guard": {"low_disk": self.low_disk, "write_error": self.write_error,
                           "note": self.guard_note, "freed_bytes": self.guard_freed},
+                "compact": dict(self.compact_state) if self.compact_state else None,
             }
         if disk:
             st["disk"] = disk
@@ -1422,13 +1634,94 @@ def time_window(body, now=None):
     return t0, t1
 
 
-def make_matcher(store, body, window=None):
-    """Devuelve (match, t0, t1). match(e) aplica ventana temporal, reglas de ocultado y filtros."""
-    preds = compile_filter(body)
+class LRU:
+    """Caché LRU con peso (nº de claves que ocupa cada valor) y acceso concurrente."""
+
+    def __init__(self, max_weight):
+        self.d, self.w, self.max = OrderedDict(), 0, max_weight
+        self.lock = threading.Lock()
+
+    def get(self, k):
+        with self.lock:
+            v = self.d.get(k)
+            if v is None:
+                return None
+            self.d.move_to_end(k)
+            return v[0]
+
+    def put(self, k, v, w=1):
+        with self.lock:
+            old = self.d.pop(k, None)
+            if old is not None:
+                self.w -= old[1]
+            self.d[k] = (v, w)
+            self.w += w
+            while self.w > self.max and len(self.d) > 1:
+                _, (_, ow) = self.d.popitem(last=False)
+                self.w -= ow
+
+
+# Los segmentos rotados no cambian: si cambian (borrado por filtro, compactación) cambia su nombre.
+# Así que lo que se calcula sobre un segmento entero se puede reutilizar mientras exista.
+COUNT_CACHE = LRU(500_000)       # (segmento, firma del filtro) -> nº de coincidencias
+AGG_CACHE = LRU(1_500_000)       # (segmento, firma, ...) -> agregados recortados (peso ≈ claves)
+RULES_CACHE = LRU(200_000)       # (segmento, firma de reglas) -> coincidencias por regla
+
+LOGS_BUDGET = 3.0     # s por petición de la tabla: luego se devuelve lo que haya y se sigue después
+STATS_BUDGET = 4.0    # s por petición de analítica
+
+
+def _seg_key(seg):
+    return seg.name[:-3] if seg.gz else seg.name   # comprimir no cambia el contenido
+
+
+def _rules_sig(pairs):
+    return [(r.get("name"), r.get("match"), r.get("conditions")) for r, _ in pairs]
+
+
+def _cond_hint(c):
+    """Texto (en minúsculas) que tiene que aparecer en la línea JSON para que la condición
+    pueda cumplirse, o None si no se puede deducir. Permite descartar líneas sin decodificarlas."""
+    if c.get("not"):
+        return None
+    op = str(c.get("op") or "contains").strip().lower()
+    if op not in ("contains", "eq", "starts", "ends"):
+        return None
+    field = str(c.get("field") or "any").strip().lower()
+    field = ALIASES.get(field, field)
+    fields = GROUPS.get(field) or ((field,) if field in FIELD_SET else None)
+    if not fields:
+        return None
+    v = str(c.get("value", "")).strip().lower()
+    if not v or not v.isascii() or '"' in v or "\\" in v or any(ord(ch) < 32 for ch in v):
+        return None
+    ft = _ftype(fields[0])
+    if ft == "num" and (fields[0] in ("ts", "id") or
+                        (op == "eq" and not re.fullmatch(r"0|[1-9]\d*", v))):
+        return None
+    if ft == "ip" and "/" in v:      # CIDR
+        return None
+    return v
+
+
+class Query:
+    """Filtro compilado: match(e), ventana [t0, t1] y una firma estable (sin la ventana) para
+    reutilizar resultados por segmento entre peticiones."""
+    __slots__ = ("match", "t0", "t1", "sig", "trivial", "keep")
+
+
+def make_query(store, body, window=None):
+    conds = list(body.get("conditions") or [])
+    qtext = (body.get("q") or "").strip()
+    if qtext:
+        conds.extend(parse_query(qtext))
+    preds = [compile_cond(c) for c in conds]
     t0, t1 = window if window else time_window(body)
-    hide = [] if body.get("show_hidden") else store.hide_preds()
+    hide_pairs = [] if body.get("show_hidden") else store.hide_rules()
+    hide = [p for _, p in hide_pairs]
     only_hl = bool(body.get("only_highlighted"))
-    hl = [p for _, p in store.hl_rules()] if only_hl else []
+    hl_pairs = store.hl_rules() if only_hl else []
+    hl = [p for _, p in hl_pairs]
 
     def match(e):
         ts = e["ts"]
@@ -1445,44 +1738,119 @@ def make_matcher(store, body, window=None):
             return False
         return True
 
-    return match, t0, t1
+    q = Query()
+    q.match, q.t0, q.t1 = match, t0, t1
+    q.trivial = not preds and not hide and not only_hl
+    q.sig = json.dumps([conds, _rules_sig(hide_pairs), only_hl, _rules_sig(hl_pairs)],
+                       sort_keys=True, default=str)
+    needles = [h for h in (_cond_hint(c) for c in conds) if h]
+    if needles:
+        def keep(line):
+            low = line.lower()
+            for n in needles:
+                if n not in low:
+                    return False
+            return True
+        q.keep = keep
+    else:
+        q.keep = None
+    return q
+
+
+def make_matcher(store, body, window=None):
+    """Devuelve (match, t0, t1). match(e) aplica ventana temporal, reglas de ocultado y filtros."""
+    q = make_query(store, body, window)
+    return q.match, q.t0, q.t1
 
 
 def iter_select(store, body, window=None):
-    match, t0, t1 = make_matcher(store, body, window)
-    for e in store.iter_entries(t0, t1):
-        if match(e):
-            yield e
+    q = make_query(store, body, window)
+    for group in store.snapshot(q.t0, q.t1):
+        yield from store.iter_group(group, q.keep, q.match)
+
+
+def _covered(q, first, last):
+    """¿La fuente cae entera dentro de la ventana? (solo entonces su resultado es reutilizable)"""
+    return (q.t0 is None or first >= q.t0) and (q.t1 is None or last <= q.t1)
+
+
+def _known_count(q, item):
+    first, last, src = item
+    if isinstance(src, list) or not _covered(q, first, last):
+        return None
+    if q.trivial:
+        return src.count
+    return COUNT_CACHE.get((_seg_key(src), q.sig))
+
+
+def _count_source(store, q, item):
+    first, last, src = item
+    n = _known_count(q, item)
+    if n is None:
+        n = sum(1 for e in store.read_source(src, q.keep) if q.match(e))
+        if not isinstance(src, list) and _covered(q, first, last):
+            COUNT_CACHE.put((_seg_key(src), q.sig), n)
+    return n
+
+
+def count_matches(store, q, deadline=None):
+    """(nº de coincidencias, exacto). Con `deadline`, deja sin contar lo que no dé tiempo."""
+    total, exact, scanned = 0, True, 0
+    for group in store.snapshot(q.t0, q.t1):
+        for item in group:
+            n = _known_count(q, item)
+            if n is None:
+                if deadline is not None and scanned and time.monotonic() > deadline:
+                    exact = False
+                    continue
+                n = _count_source(store, q, item)
+                scanned += 1
+            total += n
+    return total, exact
+
+
+def query_page(store, q, page, size, desc, budget=LOGS_BUDGET):
+    """Página `page` de las coincidencias ordenadas por fecha, sin recorrer el histórico entero:
+    los segmentos cuyo nº de coincidencias ya se conoce (metadatos o caché) se saltan sin abrirlos.
+    Si se agota el presupuesto de tiempo devuelve lo que tenga con exact=False; la siguiente
+    petición reaprovecha lo ya contado y avanza."""
+    deadline = time.monotonic() + budget
+    groups = store.snapshot(q.t0, q.t1)
+    if desc:
+        groups.reverse()
+    lo, hi = (page - 1) * size, page * size
+    offset, rows, exact, scanned = 0, [], True, 0
+    for group in groups:
+        counts = [_known_count(q, it) for it in group]
+        n = None if None in counts else sum(counts)
+        if n is not None and not (offset < hi and offset + n > lo):
+            offset += n                       # ni se abre: solo suma
+            continue
+        if scanned and time.monotonic() > deadline:
+            exact = False
+            break
+        scanned += 1
+        if n is None:
+            n = sum(_count_source(store, q, it) for it in group)
+        if offset < hi and offset + n > lo:
+            a, b = max(lo, offset) - offset, min(hi, offset + n) - offset
+            if desc:
+                a, b = n - b, n - a
+            part = []
+            for i, e in enumerate(store.iter_group(group, q.keep, q.match)):
+                if i >= b:
+                    break
+                if i >= a:
+                    part.append(e)
+            if desc:
+                part.reverse()
+            rows.extend(part)
+        offset += n
+    return offset, exact, rows
 
 
 # Tope de filas que se materializan en RAM para ordenar por una columna que no sea la fecha.
 SORT_CAP = 200_000
-
-
-def page_stream(it, page, size, desc):
-    """Pagina un flujo ya ordenado por fecha sin cargarlo entero: cuenta todo, guarda solo la página."""
-    if page * size > SORT_CAP:
-        raise ValueError("Página demasiado profunda; acota el rango de fechas o el filtro")
-    total = 0
-    if desc:
-        buf = deque(maxlen=page * size)
-        for e in it:
-            total += 1
-            buf.append(e)
-        pages = max(1, (total + size - 1) // size)
-        page = min(page, pages)
-        rows = list(buf)[::-1]
-        return total, page, pages, rows[(page - 1) * size: page * size]
-    lo, hi = (page - 1) * size, page * size
-    keep, tail = [], deque(maxlen=size)
-    for e in it:
-        if lo <= total < hi:
-            keep.append(e)
-        tail.append(e)
-        total += 1
-    pages = max(1, (total + size - 1) // size)
-    eff = min(page, pages)
-    return total, eff, pages, (keep if eff == page else list(tail))
 
 
 def select_sorted(store, body, key, direction):
@@ -1545,42 +1913,93 @@ def _bump(c, k):
     return False
 
 
-def compute_stats(store, body, window, now):
-    """Analítica en una sola pasada en streaming: memoria O(nº de cubos + claves distintas)."""
-    t0, t1 = window
-    match, _, _ = make_matcher(store, body, window)
-    b_first, b_last = store.bounds()
-    gstart = t0 if t0 is not None else (b_first if b_first is not None else now)
-    gend = t1 if t1 is not None else (now if body.get("range_seconds") else
-                                      (b_last if b_last is not None else now))
-    gspan = max(gend - gstart, 1.0)
-    fine = next((b for b in BUCKETS if gspan / b <= 20000), BUCKETS[-1])
-    tl = defaultdict(lambda: [0, 0, 0])   # cubo fino -> [logs, bytes, resaltados]
+_HIGH = ("src_ip", "dst_ip", "src_mac")   # alta cardinalidad: con tope
+_LOW = ("proto", "prefix", "chain", "in_if", "out_if", "conn_state", "scope", "device")
+_CNT_KEYS = _HIGH + _LOW + ("topics", "dst_port", "flags", "flows")
 
-    hl_rules = store.hl_rules()
-    hl_total = 0
-    rule_hits = Counter()
-    hours = [0] * 24
-    tot_bytes = n = 0
+
+_UNIQ = ("src_ip", "dst_ip", "src_mac")
+TRIM_K = 500        # claves por contador que se guardan de cada segmento en caché (sobra para top-15)
+SKETCH_K = 1024     # tamaño del bosquejo KMV para estimar nº de distintos (error típico ~3 %)
+
+
+def _agg_new():
+    return {"n": 0, "first": None, "last": None, "bytes": 0, "tl": {}, "hl": 0,
+            "rule_hits": Counter(), "hours": [0] * 24, "capped": False, "approx": False,
+            "cnt": {k: Counter() for k in _CNT_KEYS}, "b_src": Counter(), "b_dst": Counter(),
+            "sk": {k: [] for k in _UNIQ}}
+
+
+def _h64(v):
+    return int.from_bytes(hashlib.blake2b(str(v).encode(), digest_size=8).digest(), "big")
+
+
+def _agg_trim(a):
+    """Reduce un agregado para guardarlo en caché: se queda con el top-K de cada contador y, para
+    los distintos de IP/MAC, con un bosquejo KMV (los K hashes más pequeños). Así la caché aguanta
+    cientos de segmentos aunque cada uno tenga decenas de miles de IPs distintas."""
+    cnt = a["cnt"]
+    for k in _CNT_KEYS:
+        c = cnt[k]
+        if len(c) <= TRIM_K:
+            continue
+        if k in _UNIQ:
+            a["sk"][k].append((tuple(heapq.nsmallest(SKETCH_K, map(_h64, c))), len(c) <= SKETCH_K))
+        cnt[k] = Counter(dict(c.most_common(TRIM_K)))
+        a["approx"] = True
+    for kb, kc in (("b_src", "src_ip"), ("b_dst", "dst_ip")):
+        keys = cnt[kc]
+        a[kb] = Counter({ip: v for ip, v in a[kb].items() if ip in keys})
+    return a
+
+
+def _distinct(total, k):
+    """Nº de valores distintos: exacto si ningún trozo se recortó; si no, estimación KMV."""
+    parts = total["sk"][k]
+    if not parts:
+        return len(total["cnt"][k])
+    hs = set(map(_h64, total["cnt"][k]))
+    for h, _ in parts:
+        hs.update(h)
+    if all(ex for _, ex in parts) or len(hs) < SKETCH_K:
+        return len(hs)
+    kth = heapq.nsmallest(SKETCH_K, hs)[-1]
+    return int((SKETCH_K - 1) * (2 ** 64) / (kth + 1))
+
+
+def _agg_weight(a):
+    return len(a["tl"]) + len(a["b_src"]) + len(a["b_dst"]) + \
+        sum(len(c) for c in a["cnt"].values()) + sum(len(h) for p in a["sk"].values() for h, _ in p) // 8
+
+
+def _agg_entries(entries, fine, hl_rules):
+    """Agregados de analítica de un flujo de entradas (ya filtradas). Bucle caliente: todo en
+    variables locales y sin llamadas evitables."""
+    a = _agg_new()
+    tl, cnt, hours, rule_hits = a["tl"], a["cnt"], a["hours"], a["rule_hits"]
+    b_src, b_dst = a["b_src"], a["b_dst"]
+    c_src, c_dst, c_mac, c_flows = cnt["src_ip"], cnt["dst_ip"], cnt["src_mac"], cnt["flows"]
+    c_topics, c_dport, c_flags = cnt["topics"], cnt["dst_port"], cnt["flags"]
+    low = [(f, cnt[f]) for f in _LOW]
+    n = tot_bytes = hl_total = 0
     first = last = None
     capped = False
-    cnt = {k: Counter() for k in ("src_ip", "dst_ip", "proto", "prefix", "chain", "in_if",
-                                  "out_if", "conn_state", "src_mac", "scope", "device",
-                                  "topics", "dst_port", "flags", "flows")}
-    b_src, b_dst = Counter(), Counter()
-    high = ("src_ip", "dst_ip", "src_mac")   # alta cardinalidad: con tope
-    low = ("proto", "prefix", "chain", "in_if", "out_if", "conn_state", "scope", "device")
-
-    for e in store.iter_entries(t0, t1):
-        if not match(e):
-            continue
+    hour_of = {}          # franja de 15 min -> hora local (todas las zonas horarias son múltiplo)
+    localtime = time.localtime
+    for e in entries:
         ts = e["ts"]
         n += 1
-        first = ts if first is None or ts < first else first
-        last = ts if last is None or ts > last else last
-        ln = e.get("len") or 0
+        if first is None or ts < first:
+            first = ts
+        if last is None or ts > last:
+            last = ts
+        get = e.get
+        ln = get("len") or 0
         tot_bytes += ln
-        cell = tl[int(ts // fine)]
+        k = int(ts // fine)
+        cell = tl.get(k)
+        if cell is None:
+            cell = tl[k] = [0, 0, 0]
         cell[0] += 1
         cell[1] += ln
         if hl_rules:
@@ -1592,33 +2011,154 @@ def compute_stats(store, body, window, now):
             if hit:
                 hl_total += 1
                 cell[2] += 1
-        hours[time.localtime(ts).tm_hour] += 1
-        for k in high:
-            v = e.get(k)
-            if v and not _bump(cnt[k], v):
-                capped = True
-        for k in low:
-            v = e.get(k)
+        q = int(ts // 900)
+        h = hour_of.get(q)
+        if h is None:
+            h = hour_of[q] = localtime(q * 900).tm_hour
+        hours[h] += 1
+        sip, dip = get("src_ip"), get("dst_ip")
+        for v, c in ((sip, c_src), (dip, c_dst), (get("src_mac"), c_mac)):
             if v:
-                cnt[k][v] += 1
-        if e.get("topics"):
-            for t in e["topics"].split(","):
-                cnt["topics"][t] += 1
-        sip, dip, dport = e.get("src_ip"), e.get("dst_ip"), e.get("dst_port")
+                if v in c:
+                    c[v] += 1
+                elif len(c) < TOP_CAP:
+                    c[v] = 1
+                else:
+                    capped = True
+        for f, c in low:
+            v = get(f)
+            if v:
+                c[v] += 1
+        v = get("topics")
+        if v:
+            for t in v.split(","):
+                c_topics[t] += 1
+        dport = get("dst_port")
         if dport is not None:
-            cnt["dst_port"][str(dport)] += 1
-        if e.get("proto") == "TCP" and e.get("proto_info"):
-            cnt["flags"][e["proto_info"]] += 1
+            c_dport[str(dport)] += 1
+        if get("proto") == "TCP":
+            v = get("proto_info")
+            if v:
+                c_flags[v] += 1
         if sip and dip:
-            if not _bump(cnt["flows"], (sip, dip, dport)):
+            fk = (sip, dip, dport)
+            if fk in c_flows:
+                c_flows[fk] += 1
+            elif len(c_flows) < TOP_CAP:
+                c_flows[fk] = 1
+            else:
                 capped = True
-            if sip in cnt["src_ip"]:
+            if sip in c_src:
                 b_src[sip] += ln
-            if dip in cnt["dst_ip"]:
+            if dip in c_dst:
                 b_dst[dip] += ln
+    a.update(n=n, first=first, last=last, bytes=tot_bytes, hl=hl_total, capped=capped)
+    return a
+
+
+def _merge_capped(dst, src):
+    if len(dst) + len(src) <= TOP_CAP:
+        dst.update(src)
+        return False
+    capped = False
+    for k, v in src.items():
+        if k in dst:
+            dst[k] += v
+        elif len(dst) < TOP_CAP:
+            dst[k] = v
+        else:
+            capped = True
+    return capped
+
+
+def _agg_merge(a, b):
+    """Suma b en a (b no se modifica: puede venir de la caché)."""
+    if not b["n"]:
+        return
+    a["n"] += b["n"]
+    a["bytes"] += b["bytes"]
+    a["hl"] += b["hl"]
+    a["first"] = b["first"] if a["first"] is None else min(a["first"], b["first"])
+    a["last"] = b["last"] if a["last"] is None else max(a["last"], b["last"])
+    tl = a["tl"]
+    for k, v in b["tl"].items():
+        cell = tl.get(k)
+        if cell is None:
+            tl[k] = list(v)
+        else:
+            cell[0] += v[0]
+            cell[1] += v[1]
+            cell[2] += v[2]
+    a["rule_hits"].update(b["rule_hits"])
+    a["hours"] = [x + y for x, y in zip(a["hours"], b["hours"])]
+    a["capped"] = a["capped"] or b["capped"]
+    a["approx"] = a["approx"] or b["approx"]
+    for k in _UNIQ:
+        a["sk"][k].extend(b["sk"][k])
+    for k in _CNT_KEYS:
+        if k in _HIGH or k == "flows":
+            if _merge_capped(a["cnt"][k], b["cnt"][k]):
+                a["capped"] = True
+        else:
+            a["cnt"][k].update(b["cnt"][k])
+    for kb, kc in (("b_src", "src_ip"), ("b_dst", "dst_ip")):
+        keys = a["cnt"][kc]
+        dst = a[kb]
+        for ip, v in b[kb].items():
+            if ip in keys:
+                dst[ip] += v
+
+
+def compute_stats(store, body, window, now, budget=STATS_BUDGET):
+    """Analítica en streaming. Los segmentos rotados que caen enteros en la ventana se agregan una
+    vez y se reutilizan (caché); si no da tiempo a todos, se devuelve un resultado parcial
+    (`partial`) y la siguiente petición continúa donde lo dejó."""
+    deadline = time.monotonic() + budget
+    t0, t1 = window
+    q = make_query(store, body, window)
+    b_first, b_last = store.bounds()
+    gstart = t0 if t0 is not None else (b_first if b_first is not None else now)
+    gend = t1 if t1 is not None else (now if body.get("range_seconds") else
+                                      (b_last if b_last is not None else now))
+    gspan = max(gend - gstart, 1.0)
+    fine = next((b for b in BUCKETS if gspan / b <= 20000), BUCKETS[-1])
+    hl_rules = store.hl_rules()
+    agg_sig = (q.sig, json.dumps(_rules_sig(hl_rules), sort_keys=True, default=str), fine)
+
+    total = _agg_new()
+    todo, n_cov = [], 0
+    for group in store.snapshot(t0, t1):
+        for first, last, src in group:
+            if isinstance(src, list) or not _covered(q, first, last):   # activo / bordes: en vivo
+                _agg_merge(total, _agg_entries(
+                    (e for e in store.read_source(src, q.keep) if q.match(e)), fine, hl_rules))
+                continue
+            n_cov += 1
+            key = (_seg_key(src),) + agg_sig
+            cached = AGG_CACHE.get(key)
+            if cached is not None:
+                _agg_merge(total, cached)
+            else:
+                todo.append((key, src))
+    pending = 0
+    for i, (key, src) in enumerate(reversed(todo)):     # primero lo más reciente
+        if i and time.monotonic() > deadline:
+            pending = len(todo) - i
+            break
+        a = _agg_entries((e for e in store._read_segment(src, q.keep) if q.match(e)),
+                         fine, hl_rules)
+        COUNT_CACHE.put((key[0], q.sig), a["n"])
+        _agg_trim(a)
+        AGG_CACHE.put(key, a, _agg_weight(a) + 1)
+        _agg_merge(total, a)
+
+    n, first, last = total["n"], total["first"], total["last"]
+    tot_bytes, hl_total, rule_hits = total["bytes"], total["hl"], total["rule_hits"]
+    hours, cnt, capped = total["hours"], total["cnt"], total["capped"]
+    b_src, b_dst, tl = total["b_src"], total["b_dst"], total["tl"]
 
     if n == 0:
-        return {"total": 0}
+        return {"total": 0, "partial": {"pending": pending, "of": n_cov} if pending else None}
 
     start = t0 if t0 is not None else first
     end = t1 if t1 is not None else (now if body.get("range_seconds") else last)
@@ -1652,16 +2192,16 @@ def compute_stats(store, body, window, now):
              for (s, d, p), c in cnt["flows"].most_common(15)]
 
     prev_total = None
-    if t0 is not None and end > t0:
+    if t0 is not None and end > t0 and not pending:
         dur = end - t0
-        pm, _, _ = make_matcher(store, body, (t0 - dur, t0))
-        prev_total = sum(1 for e in store.iter_entries(t0 - dur, t0) if pm(e))
+        pn, exact = count_matches(store, make_query(store, body, (t0 - dur, t0)), deadline)
+        prev_total = pn if exact else None
 
     return {
         "total": n, "first_ts": first, "last_ts": last, "span": span,
         "bytes": tot_bytes, "avg_len": round(tot_bytes / n, 1) if n else 0,
-        "unique_src": len(cnt["src_ip"]), "unique_dst": len(cnt["dst_ip"]),
-        "unique_macs": len(cnt["src_mac"]), "capped": capped,
+        "unique_src": _distinct(total, "src_ip"), "unique_dst": _distinct(total, "dst_ip"),
+        "unique_macs": _distinct(total, "src_mac"), "capped": capped, "approx": total["approx"],
         "rate_per_min": round(n / (span / 60.0), 2),
         "peak": {"n": max(tl_n), "bucket": bsize,
                  "t": base + tl_n.index(max(tl_n)) * bsize},
@@ -1683,6 +2223,7 @@ def compute_stats(store, body, window, now):
             "rules": _top(rule_hits),
         },
         "spikes": spikes,
+        "partial": {"pending": pending, "of": n_cov} if pending else None,
     }
 
 
@@ -1766,9 +2307,18 @@ def create_app(store, auth=None):
         size = max(10, min(1000, int(b.get("size") or 100)))
         want = max(1, int(b.get("page") or 1))
         key, direction = b.get("sort", "ts"), b.get("dir", "desc")
+        exact = True
         if key in (None, "", "ts", "id"):
-            total, page, pages, chunk = page_stream(iter_select(store, b), want, size,
-                                                    direction != "asc")
+            q = make_query(store, b)
+            desc = direction != "asc"
+            total, exact, chunk = query_page(store, q, want, size, desc)
+            page = want
+            if exact:
+                pages = max(1, (total + size - 1) // size)
+                if want > pages:   # la página pedida ya no existe: la última (conteos ya en caché)
+                    page = pages
+                    total, exact, chunk = query_page(store, q, page, size, desc)
+            pages = max(1, (total + size - 1) // size) if exact else None
         else:
             rows = select_sorted(store, b, key, direction)
             total = len(rows)
@@ -1787,7 +2337,7 @@ def create_app(store, auth=None):
             if names:
                 d["hl"] = {"color": color, "names": names}
             out.append(d)
-        return jsonify(total=total, page=page, pages=pages, size=size, entries=out)
+        return jsonify(total=total, exact=exact, page=page, pages=pages, size=size, entries=out)
 
     @app.post("/api/stats")
     def api_stats():
@@ -1900,6 +2450,10 @@ def create_app(store, auth=None):
     @app.get("/api/segments/<name>")
     def api_segment_get(name):
         return send_file(store.segment_path(name), as_attachment=True, download_name=name)
+
+    @app.post("/api/segments/compact")
+    def api_segments_compact():
+        return jsonify(store.start_compaction())
 
     @app.delete("/api/segments/<name>")
     def api_segment_delete(name):

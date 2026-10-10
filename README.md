@@ -43,6 +43,24 @@ coincide con IPsec NAT-T). Si vienes de una instalación anterior:
 
 ## Novedades de esta versión
 
+- **Históricos de millones de logs**: la tabla ya no lee todo el histórico en
+  cada refresco. Ordenada por fecha, solo abre los segmentos de la página
+  pedida; el total sin filtros sale de los nombres de los segmentos y, con
+  filtros, el nº de coincidencias de cada segmento rotado se recuerda en RAM.
+  Si una búsqueda tarda, la tabla muestra en ≤ 3 s lo que lleva
+  («≥ N coincidencias · contando…») y sigue sola hasta el total exacto.
+  La analítica funciona igual (por tandas de ≤ 4 s, «analizando… X de Y
+  segmentos») y, una vez calculada, los refrescos tardan décimas. En rangos
+  grandes las IP distintas son una estimación (≈, error típico ~3 %).
+  El navegador cancela la petición anterior al cambiar de filtro y el
+  refresco automático no lanza otra si la anterior sigue en curso.
+  Opcional: `pip install orjson` acelera la lectura del histórico ~2×.
+- **Compactar segmentos** (Ajustes → Segmentos): fusiona segmentos
+  consecutivos pequeños (tras borrar por filtro, rotar a mano o cambiar la
+  rotación) hasta el estándar configurado (MB descomprimidos u horas de
+  registro). Se hace en segundo plano y es seguro ante cortes: un diario
+  (`compact.journal`) evita duplicados si se interrumpe.
+
 - **Avisos de carga**: la tabla de logs, la analítica, las reglas y Ajustes
   muestran un "Cargando…" con spinner cuando una petición tarda más de
   300 ms (búsquedas grandes, históricos, etc.).
