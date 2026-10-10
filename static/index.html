@@ -1,0 +1,233 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MikroTik Logs</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+<header class="top">
+  <div class="brand">MikroTik Logs</div>
+  <div class="pills">
+    <span class="pill" id="pill-listener" title="Receptor syslog UDP">UDP …</span>
+    <span class="pill" id="pill-count">0 logs</span>
+    <span class="pill" id="pill-rate">0/s</span>
+    <span class="pill" id="pill-disk" title="Espacio libre en el disco donde se guardan los logs">disco …</span>
+    <span class="pill" id="pill-save">…</span>
+  </div>
+  <div class="top-actions">
+    <label class="live-picker" title="Actualiza automáticamente la tabla de logs y la analítica cuando llegan datos nuevos">
+      <span id="live-dot" class="livedot"></span> En vivo
+      <select id="live-interval">
+        <option value="10">cada 10 s</option>
+        <option value="30">cada 30 s</option>
+        <option value="60">cada 1 min</option>
+        <option value="0">desactivado</option>
+      </select>
+    </label>
+    <button id="btn-capture" class="toggle on" title="Pausar o reanudar la captura de logs nuevos">Capturando</button>
+    <button id="btn-save" title="Volcar el búfer a disco ahora">Guardar</button>
+  </div>
+</header>
+<div id="banner" class="banner" hidden></div>
+
+<nav class="tabs">
+  <button data-tab="logs" class="active">Logs</button>
+  <button data-tab="analytics">Analítica</button>
+  <button data-tab="rules">Reglas</button>
+  <button data-tab="storage">Ajustes</button>
+  <button data-tab="help">Ayuda</button>
+</nav>
+
+<!-- Barra de filtros compartida por Logs y Analítica -->
+<section id="filterbar" class="filterbar">
+  <div class="frow">
+    <input id="f-q" type="search" spellcheck="false" autocomplete="off"
+           placeholder='Buscar: texto  src:192.168.0.0/24  dport:853,443  -proto:udp  len:>100  /regex/'>
+    <div class="ranges" id="f-ranges">
+      <button data-s="0">Todo</button>
+      <button data-s="300">5 min</button>
+      <button data-s="900">15 min</button>
+      <button data-s="3600" class="active">1 h</button>
+      <button data-s="21600">6 h</button>
+      <button data-s="86400">24 h</button>
+      <button data-s="604800">7 d</button>
+    </div>
+    <button id="f-adv-toggle">Avanzado</button>
+    <button id="f-clear" title="Quitar todos los filtros">Limpiar</button>
+  </div>
+  <div id="f-chips" class="chips"></div>
+  <div id="f-adv" class="adv" hidden>
+    <div class="adv-col">
+      <h4>Condiciones (todas deben cumplirse)</h4>
+      <div id="f-conds"></div>
+      <button id="f-add-cond" class="small">+ Condición</button>
+    </div>
+    <div class="adv-col">
+      <h4>Rango de fechas</h4>
+      <label>Desde <input type="datetime-local" id="f-from"></label>
+      <label>Hasta <input type="datetime-local" id="f-to"></label>
+      <h4>Opciones</h4>
+      <label class="chk"><input type="checkbox" id="f-hidden"> Mostrar mensajes excluidos (modo «ocultar»)</label>
+      <label class="chk"><input type="checkbox" id="f-onlyhl"> Solo mensajes resaltados</label>
+    </div>
+    <div class="adv-col">
+      <h4>Búsquedas guardadas</h4>
+      <div class="row">
+        <select id="f-saved"><option value="">— elegir —</option></select>
+        <button id="f-saved-del" class="small" title="Borrar la búsqueda elegida">Borrar</button>
+      </div>
+      <button id="f-saved-save" class="small">Guardar búsqueda actual…</button>
+    </div>
+  </div>
+</section>
+
+<main>
+  <!-- LOGS -->
+  <section id="tab-logs" class="tab active">
+    <div class="toolbar">
+      <div class="seg" id="view-mode">
+        <button data-v="table" class="active">Tabla</button>
+        <button data-v="raw">Texto</button>
+      </div>
+      <span id="logs-summary" class="muted"></span>
+      <span class="spacer"></span>
+      <label class="muted">Filas
+        <select id="pg-size"><option>50</option><option selected>100</option><option>200</option><option>500</option></select>
+      </label>
+      <div class="pager" id="pager-top"></div>
+    </div>
+    <div class="tablewrap">
+      <table id="logtable">
+        <thead><tr>
+          <th data-sort="ts">Hora</th>
+          <th data-sort="topics">Topics</th>
+          <th data-sort="prefix">Prefijo</th>
+          <th data-sort="chain">Cadena</th>
+          <th data-sort="in_if">In</th>
+          <th data-sort="out_if">Out</th>
+          <th data-sort="proto">Proto</th>
+          <th data-sort="src_ip">Origen</th>
+          <th data-sort="dst_ip">Destino</th>
+          <th data-sort="conn_state">Estado</th>
+          <th data-sort="len">Len</th>
+          <th>Detalle</th>
+        </tr></thead>
+        <tbody id="logbody"></tbody>
+      </table>
+      <div id="rawview" hidden></div>
+      <div id="logs-empty" class="empty" hidden></div>
+    </div>
+    <div class="toolbar"><span class="spacer"></span><div class="pager" id="pager-bottom"></div></div>
+  </section>
+
+  <!-- ANALÍTICA -->
+  <section id="tab-analytics" class="tab">
+    <div class="toolbar">
+      <span id="an-summary" class="muted"></span>
+      <span class="spacer"></span>
+      <button id="an-refresh" class="small">Actualizar</button>
+    </div>
+    <div id="an-body"></div>
+  </section>
+
+  <!-- REGLAS -->
+  <section id="tab-rules" class="tab">
+    <div class="toolbar">
+      <p class="muted grow">Las reglas <b>resaltan</b> mensajes en amarillo (o el color que elijas) o los <b>excluyen</b>.
+        Excluir puede ser «no guardar» (se descarta al recibir) u «ocultar» (se guarda pero no se muestra).
+        Si varias reglas de resaltado coinciden, manda la primera de la lista.</p>
+      <button id="rule-new" class="primary">Nueva regla</button>
+    </div>
+    <div id="rules-body"></div>
+  </section>
+
+  <!-- GUARDADO -->
+  <section id="tab-storage" class="tab">
+    <div id="st-body" class="grid2"></div>
+  </section>
+
+  <!-- AYUDA -->
+  <section id="tab-help" class="tab">
+    <div class="help">
+      <h3>Configurar el MikroTik</h3>
+      <pre>/system logging action
+add name=logviewer target=remote remote=IP_DE_ESTE_SERVIDOR remote-port=4501
+
+/system logging
+add topics=firewall action=logviewer
+# opcional: más topics (system, dhcp, wireguard, error, warning…)
+add topics=system,error,warning action=logviewer</pre>
+      <p>El receptor acepta el formato por defecto de RouterOS (<code>topics mensaje</code>) y también el formato
+        syslog BSD con cabecera <code>&lt;PRI&gt;Mmm dd hh:mm:ss host …</code>. La hora que se guarda es la de recepción,
+        porque el formato por defecto no incluye fecha.</p>
+      <p>Los logs de firewall salen si la regla tiene <code>log=yes log-prefix=MI-PREFIJO</code>.</p>
+
+      <h3>Lenguaje de búsqueda</h3>
+      <p>Los términos se combinan con Y. Un término suelto busca en el mensaje completo.</p>
+      <table class="kv">
+        <tr><td><code>192.168.0.103</code></td><td>texto en cualquier parte del mensaje</td></tr>
+        <tr><td><code>"TCP (SYN)"</code></td><td>frase con espacios (entre comillas)</td></tr>
+        <tr><td><code>-udp</code></td><td>negar: no debe aparecer</td></tr>
+        <tr><td><code>src:10.0.0.0/8</code></td><td>IP o red CIDR de origen (<code>dst:</code> para destino, <code>ip:</code> para cualquiera de las dos)</td></tr>
+        <tr><td><code>dport:853,443</code></td><td>lista de valores (<code>sport:</code>, <code>port:</code> para cualquiera)</td></tr>
+        <tr><td><code>len:&gt;100</code> <code>len:&lt;=64</code></td><td>comparaciones numéricas</td></tr>
+        <tr><td><code>proto:tcp</code> <code>chain:forward</code> <code>prefix:FW-</code></td><td>el texto del campo contiene el valor</td></tr>
+        <tr><td><code>in=bridge_lan</code> <code>state!=new</code></td><td><code>=</code> igualdad exacta, <code>!=</code> distinto</td></tr>
+        <tr><td><code>/SYN.*ACK/</code> <code>msg:/regex/</code></td><td>expresión regular</td></tr>
+        <tr><td><code>if:wg_vps</code></td><td>interfaz de entrada o de salida</td></tr>
+      </table>
+      <p>Campos: <code>src dst sport dport ip port mac proto flags in out if chain prefix topics level state mark nat len scope host msg</code>.
+        <code>scope</code> vale <i>entrante / saliente / interno / externo</i> según si las IP son públicas o privadas (no mira la interfaz).</p>
+
+      <h3>Atajos en la tabla</h3>
+      <p>Clic en una IP, puerto, interfaz, etc. → añade el filtro. <b>Mayús + clic</b> → lo excluye. Clic en la fila → detalle,
+        con casillas para crear una regla a partir de los campos que marques.</p>
+      <h3>Notas</h3>
+      <p>El firewall del servidor debe permitir UDP 4501 desde el router. Si cambias el puerto a 4500,
+        ten en cuenta que también lo usa IPsec NAT-T: si este equipo ejecuta IPsec, ese puerto estará ocupado.</p>
+    </div>
+  </section>
+</main>
+
+<!-- Diálogo de reglas -->
+<dialog id="ruleDlg">
+  <form method="dialog" id="ruleForm">
+    <h3 id="ruleTitle">Regla</h3>
+    <label>Nombre <input id="r-name" maxlength="80" required></label>
+    <div class="row">
+      <label>Acción
+        <select id="r-action">
+          <option value="highlight">Resaltar</option>
+          <option value="exclude">Excluir</option>
+        </select>
+      </label>
+      <label id="r-mode-wrap" hidden>Modo
+        <select id="r-mode">
+          <option value="drop">No guardar (descartar al recibir)</option>
+          <option value="hide">Guardar pero ocultar en la vista</option>
+        </select>
+      </label>
+      <label id="r-color-wrap">Color <input type="color" id="r-color" value="#ffeb3b"></label>
+      <label>Cumplir
+        <select id="r-match"><option value="all">todas las condiciones</option><option value="any">alguna condición</option></select>
+      </label>
+    </div>
+    <div id="r-conds"></div>
+    <button type="button" id="r-add-cond" class="small">+ Condición</button>
+    <div id="r-test" class="testbox" hidden></div>
+    <div class="dlg-actions">
+      <button type="button" id="r-test-btn">Probar contra los logs</button>
+      <span class="spacer"></span>
+      <button type="button" id="r-cancel">Cancelar</button>
+      <button type="submit" class="primary" id="r-save">Guardar regla</button>
+    </div>
+  </form>
+</dialog>
+
+<div id="toast" class="toast" hidden></div>
+<script src="/static/app.js"></script>
+</body>
+</html>

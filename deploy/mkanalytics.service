@@ -1,0 +1,15 @@
+[Unit]
+Description=MikroTik Log Viewer
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/mkanalytics
+ExecStart=/usr/bin/python3 /opt/mkanalytics/app.py --syslog-port 4501 --web-port 8080 --data-dir /opt/mkanalytics/data
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target
