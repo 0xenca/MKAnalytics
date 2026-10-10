@@ -338,18 +338,29 @@ function detailRowHtml(e) {
 }
 
 let currentRows = [];
-function renderPager(box, page, pages) {
+function renderPager(box, page, pages, hasMore) {
+  // pages === null: el total aún se está contando (no se sabe cuál es la última página)
+  const last = pages ?? page;
+  const nextOff = pages === null ? !hasMore : page >= pages;
   box.innerHTML = `<button data-p="1" ${page <= 1 ? 'disabled' : ''} title="Primera">«</button>` +
-    `<button data-p="${page - 1}" ${page <= 1 ? 'disabled' : ''}>‹</button><span>${page} / ${pages}</span>` +
-    `<button data-p="${page + 1}" ${page >= pages ? 'disabled' : ''}>›</button>` +
-    `<button data-p="${pages}" ${page >= pages ? 'disabled' : ''} title="Última">»</button>`;
+    `<button data-p="${page - 1}" ${page <= 1 ? 'disabled' : ''}>‹</button><span>${page} / ${pages === null ? '?' : pages}</span>` +
+    `<button data-p="${page + 1}" ${nextOff ? 'disabled' : ''}>›</button>` +
+    `<button data-p="${last}" ${pages === null || page >= pages ? 'disabled' : ''} title="${pages === null ? 'Última (disponible al terminar de contar)' : 'Última'}">»</button>`;
 }
 
-async function loadLogs() {
-  const seq = ++S.seq;
+// Con históricos enormes el servidor responde en ≤ 3 s con lo que lleva y `exact: false`;
+// se vuelve a pedir enseguida (sin capa de "Cargando…") y cada vuelta avanza, porque el
+// servidor recuerda lo ya contado por segmento.
+let logsCtl = null, logsCont = null;
+async function loadLogs(cont = false) {
+  const seq = cont ? S.seq : ++S.seq;
+  clearTimeout(logsCont);
+  if (logsCtl) logsCtl.abort();
+  const ctl = logsCtl = new AbortController();
   const inp = $('#f-q');
   try {
-    const d = await withLoading($('.tablewrap'), () => post('/api/logs', filterBody({ sort: S.sort, dir: S.dir, page: S.page, size: S.size })));
+    const req = () => api('/api/logs', { method: 'POST', signal: ctl.signal, body: filterBody({ sort: S.sort, dir: S.dir, page: S.page, size: S.size }) });
+    const d = cont ? await req() : await withLoading($('.tablewrap'), req);
     if (seq !== S.seq) return;
     inp.classList.remove('bad');
     S.page = d.page;
@@ -358,10 +369,13 @@ async function loadLogs() {
     S.expanded = new Set([...S.expanded].filter(id => present.has(id)));
     updateLiveButton();
     const empty = $('#logs-empty');
-    $('#logs-summary').textContent = `${fmtN(d.total)} coincidencias`;
+    $('#logs-summary').innerHTML = d.exact ? `${fmtN(d.total)} coincidencias`
+      : `≥ ${fmtN(d.total)} coincidencias <span class="counting">contando…</span>`;
     empty.hidden = d.entries.length > 0;
     if (!d.entries.length) {
-      empty.textContent = 'No hay logs que coincidan. Amplía el rango de tiempo o quita filtros; si acabas de configurar el router, comprueba que llegan datagramas al puerto UDP (indicador superior).';
+      empty.textContent = d.exact
+        ? 'No hay logs que coincidan. Amplía el rango de tiempo o quita filtros; si acabas de configurar el router, comprueba que llegan datagramas al puerto UDP (indicador superior).'
+        : 'Buscando en el histórico…';
     }
     const raw = S.view === 'raw';
     $('#logtable').hidden = raw; $('#rawview').hidden = !raw;
@@ -377,14 +391,18 @@ async function loadLogs() {
       th.classList.remove('sorted-asc', 'sorted-desc');
       if (th.dataset.sort === S.sort) th.classList.add('sorted-' + S.dir);
     });
-    renderPager($('#pager-top'), d.page, d.pages);
-    renderPager($('#pager-bottom'), d.page, d.pages);
+    const more = d.entries.length >= d.size;
+    renderPager($('#pager-top'), d.page, d.pages, more);
+    renderPager($('#pager-bottom'), d.page, d.pages, more);
     S.lastId = S.status ? S.status.last_id : S.lastId;
+    if (!d.exact && S.tab === 'logs') logsCont = setTimeout(() => { if (seq === S.seq) loadLogs(true); }, 150);
   } catch (e) {
-    if (seq !== S.seq) return;
+    if (e.name === 'AbortError' || seq !== S.seq) return;
     inp.classList.add('bad');
     $('#logs-empty').hidden = false;
     $('#logs-empty').textContent = 'Error en la búsqueda: ' + e.message;
+  } finally {
+    if (logsCtl === ctl) logsCtl = null;
   }
 }
 
@@ -473,18 +491,27 @@ function barsSvg(vals, opts = {}) {
   return s + '</svg>';
 }
 
-async function loadStats() {
-  const seq = ++S.seqStats;
+let statsCtl = null, statsCont = null;
+async function loadStats(cont = false) {
+  const seq = cont ? S.seqStats : ++S.seqStats;
+  clearTimeout(statsCont);
+  if (statsCtl) statsCtl.abort();
+  const ctl = statsCtl = new AbortController();
   const body = filterBody();
   try {
-    const d = await withLoading($('#an-body'), () => post('/api/stats', body), { text: 'Calculando estadísticas…' });
+    const req = () => api('/api/stats', { method: 'POST', signal: ctl.signal, body });
+    const d = cont ? await req() : await withLoading($('#an-body'), req, { text: 'Calculando estadísticas…' });
     if (seq !== S.seqStats) return;
     S.lastStats = Date.now();
     S.statsId = S.status ? S.status.last_id : null;
     renderStats(d);
+    // Resultado parcial: el servidor analiza el histórico por tandas y recuerda lo ya hecho.
+    if (d.partial && S.tab === 'analytics') statsCont = setTimeout(() => { if (seq === S.seqStats) loadStats(true); }, 150);
   } catch (e) {
-    if (seq !== S.seqStats) return;
+    if (e.name === 'AbortError' || seq !== S.seqStats) return;
     $('#an-body').innerHTML = `<div class="empty">Error: ${esc(e.message)}</div>`;
+  } finally {
+    if (statsCtl === ctl) statsCtl = null;
   }
 }
 
@@ -492,10 +519,12 @@ function renderStats(d) {
   const box = $('#an-body');
   if (!d.total) {
     $('#an-summary').textContent = '';
-    box.innerHTML = '<div class="empty">No hay logs en este filtro. Amplía el rango o quita filtros.</div>';
+    box.innerHTML = d.partial ? `<div class="empty">Analizando el histórico… (${fmtN(d.partial.of - d.partial.pending)} de ${fmtN(d.partial.of)} segmentos)</div>`
+      : '<div class="empty">No hay logs en este filtro. Amplía el rango o quita filtros.</div>';
     return;
   }
-  $('#an-summary').textContent = `${fmtN(d.total)} logs · ${fmtTs(d.first_ts)} → ${fmtTs(d.last_ts)}`;
+  $('#an-summary').innerHTML = `${fmtN(d.total)} logs · ${esc(fmtTs(d.first_ts))} → ${esc(fmtTs(d.last_ts))}` +
+    (d.partial ? ` <span class="counting">analizando… ${fmtN(d.partial.of - d.partial.pending)} de ${fmtN(d.partial.of)} segmentos</span>` : '');
   let delta = '';
   if (d.prev_total !== null && d.prev_total !== undefined) {
     if (d.prev_total === 0) delta = `<div class="d">periodo anterior: 0</div>`;
@@ -507,7 +536,7 @@ function renderStats(d) {
   const kpi = (v, l, extra = '') => `<div class="kpi"><div class="v">${v}</div><div class="l">${l}</div>${extra}</div>`;
   let h = `<div class="kpis">` +
     kpi(fmtN(d.total), 'logs', delta) +
-    kpi(fmtN(d.unique_src), 'IP de origen distintas') + kpi(fmtN(d.unique_dst), 'IP de destino distintas') +
+    kpi((d.approx ? '≈ ' : '') + fmtN(d.unique_src), 'IP de origen distintas') + kpi((d.approx ? '≈ ' : '') + fmtN(d.unique_dst), 'IP de destino distintas') +
     kpi(fmtBytes(d.bytes), 'tráfico visto en los logs', `<div class="d muted">media ${d.avg_len} B/paquete</div>`) +
     kpi(d.rate_per_min, 'logs por minuto', `<div class="d muted">pico ${fmtN(d.peak.n)} en ${fmtDur(d.peak.bucket)}</div>`) +
     kpi(fmtN(d.highlighted), 'resaltados', `<div class="d muted">${d.total ? ((d.highlighted / d.total) * 100).toFixed(1) : 0}% del total</div>`) +
@@ -777,8 +806,19 @@ async function loadStorage() {
       `<div class="btnrow"><label class="muted">Borrar logs con más de <input id="pg-days" type="number" min="1" value="7" style="width:70px"> días</label><button data-act="purge-old" class="danger">Borrar antiguos</button></div>` +
       `<div class="btnrow"><button data-act="purge-filter" class="danger">Borrar los que coinciden con el filtro actual</button><button data-act="purge-all" class="danger">Vaciar todo</button></div></div>` +
 
-      `<div class="card" style="grid-column:1/-1"><h4>Segmentos <small>rotados, del más reciente al más antiguo</small></h4>${segTable}</div>`;
+      `<div class="card" style="grid-column:1/-1"><h4>Segmentos <small>rotados, del más reciente al más antiguo</small></h4>` +
+      `<div class="btnrow"><button data-act="compact">Compactar segmentos</button><span id="compact-state" class="muted">${compactText(st.compact)}</span></div>` +
+      `<p class="note">Fusiona segmentos consecutivos pequeños (p. ej. tras borrar por filtro o cambiar la rotación) hasta el tamaño estándar: ${s.rotate_size_mb} MB descomprimidos${s.rotate_hours ? ` o ${s.rotate_hours} h de registro` : ''}. Se hace en segundo plano; la captura sigue funcionando.</p>` +
+      `${segTable}</div>`;
   } catch (e) { box.innerHTML = `<div class="empty">Error: ${esc(e.message)}</div>`; }
+}
+
+function compactText(c) {
+  if (!c) return '';
+  if (c.running) return `Compactando… lote ${fmtN(c.done)} de ${fmtN(c.total)}`;
+  if (c.error) return `Compactación detenida: ${esc(c.error)}`;
+  if (!c.total) return 'No había nada que compactar: los segmentos ya tienen el tamaño estándar.';
+  return `Última compactación: ${fmtN(c.segments_in)} segmentos → ${fmtN(c.segments_out)}${c.finished ? ` (${esc(fmtTs(c.finished))})` : ''}`;
 }
 
 function initStorage() {
@@ -792,6 +832,12 @@ function initStorage() {
 
 async function runStorageAction(act, b) {
       if (act === 'save') { await saveNow(); loadStorage(); }
+      else if (act === 'compact') {
+        if (!confirm('¿Compactar los segmentos rotados? Los consecutivos pequeños se fusionan hasta el tamaño de rotación configurado. Los logs no se pierden.')) return;
+        const r = await post('/api/segments/compact');
+        toast(r.total ? `Compactando ${fmtN(r.segments_in)} segmentos en ${fmtN(r.total)}…` : 'No hay segmentos que compactar');
+        loadStorage();
+      }
       else if (act === 'rotate') { const r = await post('/api/rotate'); toast('Rotado: ' + r.name); loadStorage(); }
       else if (act === 'seg-del') {
         const name = b.dataset.name;
@@ -891,6 +937,12 @@ function renderStatus(s) {
   if (g.write_error) msgs.push('No se puede escribir en disco: ' + g.write_error);
   bn.hidden = !msgs.length; bn.textContent = msgs.join(' · ');
   bn.className = 'banner' + (L.error || g.low_disk || g.write_error ? ' err' : '');
+  // progreso de la compactación en Ajustes; al terminar se recarga la lista de segmentos
+  const c = s.compact, cs = $('#compact-state');
+  if (cs) cs.innerHTML = compactText(c);
+  const running = !!(c && c.running);
+  if (S.compacting && !running && S.tab === 'storage') loadStorage();
+  S.compacting = running;
 }
 
 let offline = false;
@@ -914,8 +966,8 @@ function scheduleLive() {
 }
 function liveTick() {
   if (S.liveSec && !S.expanded.size) {
-    if (S.tab === 'logs' && S.page === 1) loadLogs();
-    else if (S.tab === 'analytics') loadStats();
+    if (S.tab === 'logs' && S.page === 1) { if (!logsCtl) loadLogs(); }
+    else if (S.tab === 'analytics') { if (!statsCtl) loadStats(); }
   }
   scheduleLive();
 }
