@@ -1,5 +1,8 @@
 # MKAnalytics — paquete de despliegue
 
+<img width="1923" height="917" alt="image" src="https://github.com/user-attachments/assets/ad17ed18-2ffc-468a-bfed-f0debaf1a29d" />
+
+
 Contiene solo el código de la app (`app.py`, `static/`) y la unidad systemd de
 referencia. **No incluye `data/`**: si ya tienes una instalación en marcha,
 descomprimir este zip encima no toca tus logs ni tu configuración.
