@@ -1,92 +1,154 @@
-# MKAnalytics — paquete de despliegue
+# MKAnalytics
 
-<img width="1923" height="917" alt="image" src="https://github.com/user-attachments/assets/ad17ed18-2ffc-468a-bfed-f0debaf1a29d" />
+Visor y analizador de logs de **MikroTik RouterOS** autoalojado. El router envía
+sus logs por syslog (UDP) a un servidor Linux y MKAnalytics los guarda, los
+muestra en una web para buscarlos y filtrarlos, y saca estadísticas
+(IPs, puertos, flujos, picos de tráfico…).
 
+<img width="1923" height="917" alt="Captura de MKAnalytics" src="https://github.com/user-attachments/assets/ad17ed18-2ffc-468a-bfed-f0debaf1a29d" />
 
-Contiene solo el código de la app (`app.py`, `static/`) y la unidad systemd de
-referencia. **No incluye `data/`**: si ya tienes una instalación en marcha,
-descomprimir este zip encima no toca tus logs ni tu configuración.
+## Cómo funciona
 
-## Instalar / actualizar en el servidor
+```
+MikroTik ──syslog UDP :4501──▶ app.py ──▶ data/logs/*.ndjson(.gz)
+                                  │
+                                  └──web :8080──▶ navegador (Logs · Analítica · Reglas · Ajustes)
+```
+
+1. **Recepción.** `app.py` escucha en UDP (por defecto **4501**). Cada línea que
+   llega se interpreta: topics, nivel, y en los logs de firewall cadena,
+   interfaces, protocolo, IPs/puertos de origen y destino, MAC, estado de
+   conexión, NAT y longitud. La hora guardada es la de recepción (el formato
+   por defecto de RouterOS no lleva fecha). También acepta syslog BSD
+   (`<PRI>Mmm dd hh:mm:ss host …`).
+2. **Reglas al recibir.** Antes de guardar se aplican tus reglas: *descartar*
+   (no se guarda), *ocultar* (se guarda pero no se ve por defecto) o *resaltar*
+   (se colorea en la tabla).
+3. **Almacenamiento.** Los logs se escriben en `data/logs/current.ndjson`
+   (una línea JSON por log) y se vuelcan a disco cada pocos segundos. Al
+   llegar al tamaño o la antigüedad de rotación (32 MB / 24 h por defecto), el
+   segmento se cierra, se renombra `seg-<desde>-<hasta>-<último id>-<nº>.ndjson`
+   y se comprime con gzip. No hay tope de logs: el límite es el disco, con una
+   protección configurable (% libre mínimo → borrar los segmentos más antiguos o
+   pausar la captura) y retención opcional por días.
+4. **Consulta.** La web pide a la API solo lo que necesita: la tabla abre los
+   segmentos de la página que miras y la analítica reutiliza lo ya calculado
+   por segmento, así que funciona con millones de logs.
+
+La configuración (ajustes, reglas, búsquedas guardadas) vive en
+`data/config.json`.
+
+## Tutorial
+
+### 1. Instalar en el servidor
+
+Requisitos: Linux con Python 3.9+.
 
 ```bash
-# 1) copiar el código (crea /opt/mkanalytics si no existe)
-sudo mkdir -p /opt/mkanalytics
-sudo unzip -o mkanalytics.zip -d /tmp/mkanalytics-new
-sudo rsync -a --exclude 'deploy' --exclude 'README.md' \
-    /tmp/mkanalytics-new/mkanalytics/ /opt/mkanalytics/
-
-# 2) dependencias (solo la primera vez, o si cambian)
+git clone https://github.com/0xenca/MKAnalytics.git /opt/mkanalytics
 sudo python3 -m pip install -r /opt/mkanalytics/requirements.txt
+sudo python3 -m pip install orjson          # opcional: lectura del histórico ~2× más rápida
 
-# 3) unidad systemd (solo la primera vez; si ya la tenías, revisa el puerto)
+# servicio systemd
 sudo cp /opt/mkanalytics/deploy/mkanalytics.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now mkanalytics
+```
 
-# actualizaciones posteriores: repite el paso 1 y luego
+Para probar sin instalar: `python3 app.py` (UDP 4501, web en
+`http://IP_DEL_SERVIDOR:8080`).
+
+Opciones (`app.py --help`): `--syslog-port`, `--web-port`, `--web-host`,
+`--syslog-host`, `--data-dir`, o las variables `SYSLOG_PORT`, `WEB_PORT`,
+`WEB_HOST`, `SYSLOG_HOST`, `DATA_DIR`.
+
+**Seguridad.** Si la web va a ser accesible desde la red, activa la
+autenticación definiendo `LOGVIEW_USER` y `LOGVIEW_PASS` en el servicio
+(`Environment=…` en la unidad systemd), o escucha solo en local
+(`--web-host 127.0.0.1`) detrás de un proxy inverso con HTTPS.
+
+Firewall del servidor: abre **UDP 4501** solo desde la IP del router y el
+puerto web solo a quien deba verlo.
+
+### 2. Configurar el MikroTik
+
+```
+/system logging action
+add name=logviewer target=remote remote=IP_DEL_SERVIDOR remote-port=4501
+
+/system logging
+add topics=firewall action=logviewer
+# opcional: más topics
+add topics=system,error,warning action=logviewer
+```
+
+Las reglas de firewall solo generan log si tienen `log=yes` (recomendable
+`log-prefix=` para distinguirlas luego):
+
+```
+/ip firewall filter set [find comment="drop wan"] log=yes log-prefix=DROP-WAN
+```
+
+En la cabecera de la web, la píldora **UDP :4501 escuchando** y el contador de
+logs/s confirman que llegan datos.
+
+### 3. Usar la web
+
+- **Logs**: tabla en vivo. Clic en una IP, puerto o interfaz → filtra por ese
+  valor; Mayús + clic → lo excluye. Clic en una fila → detalle y botón para
+  crear una regla a partir de los campos marcados. Vista tabla o texto crudo.
+- **Búsqueda**: los términos se combinan con Y.
+
+  | Ejemplo | Significado |
+  |---|---|
+  | `192.168.0.10` | texto en cualquier parte del mensaje |
+  | `"TCP (SYN)"` | frase exacta |
+  | `-udp` | excluir |
+  | `src:10.0.0.0/8` | IP o red de origen (`dst:`, `ip:` = cualquiera) |
+  | `dport:53,443` | lista de valores (`sport:`, `port:`) |
+  | `len:>100` | comparación numérica |
+  | `in=bridge state!=new` | igualdad exacta / distinto |
+  | `/SYN.*ACK/` | expresión regular |
+
+  Las búsquedas se pueden guardar. El panel **Avanzado** permite construir
+  condiciones sin escribir la sintaxis.
+- **Analítica**: línea temporal (clic en una barra para acotar), actividad por
+  hora, picos, tops de IPs, puertos, flujos, protocolos, interfaces… Todo
+  respeta el filtro y el rango de tiempo activos.
+- **Reglas**: resaltar, ocultar o descartar logs según condiciones, con
+  prueba sobre las últimas 24 h antes de guardar.
+- **Ajustes**: estado del disco y previsión de llenado, rotación, compresión,
+  retención, exportar/importar (JSON/CSV), borrados, lista de segmentos
+  (descargar, borrar, **compactar**).
+
+## Actualizar
+
+```bash
+cd /opt/mkanalytics && sudo git pull
 sudo systemctl restart mkanalytics
 ```
 
-## Puerto syslog: 4501
+`data/` no está en el repositorio: actualizar no toca tus logs ni tu
+configuración.
 
-El receptor UDP escucha ahora en **4501** por defecto (antes 4500, que
-coincide con IPsec NAT-T). Si vienes de una instalación anterior:
+## Cambios entre versiones
 
-- Actualiza la regla del MikroTik: `remote-port=4501` en
-  `/system logging action`.
-- Si ya tenías `/etc/systemd/system/mkanalytics.service` con `--syslog-port
-  4500`, sustitúyelo por el de este paquete (`deploy/mkanalytics.service`)
-  o edita el `ExecStart` a mano.
-- El firewall del servidor debe permitir UDP 4501 entrante desde el router
-  (y ya no hace falta abrir el 4500, salvo que también uses IPsec ahí).
+Resumen; el detalle de cada versión está en
+[Releases](https://github.com/0xenca/MKAnalytics/releases).
 
-## Novedades de esta versión
+**Actual**
+- Rendimiento con millones de logs: la tabla y la analítica ya no recorren
+  todo el histórico en cada refresco. Las búsquedas largas muestran
+  resultados en ≤ 3 s («≥ N coincidencias · contando…») y terminan solas;
+  la analítica avanza por tandas y después se refresca en décimas. En rangos
+  grandes, las IP distintas son una estimación (≈).
+- Botón **Compactar segmentos** (Ajustes → Segmentos): fusiona segmentos
+  pequeños hasta el tamaño/antigüedad de rotación, en segundo plano y seguro
+  ante cortes.
 
-- **Históricos de millones de logs**: la tabla ya no lee todo el histórico en
-  cada refresco. Ordenada por fecha, solo abre los segmentos de la página
-  pedida; el total sin filtros sale de los nombres de los segmentos y, con
-  filtros, el nº de coincidencias de cada segmento rotado se recuerda en RAM.
-  Si una búsqueda tarda, la tabla muestra en ≤ 3 s lo que lleva
-  («≥ N coincidencias · contando…») y sigue sola hasta el total exacto.
-  La analítica funciona igual (por tandas de ≤ 4 s, «analizando… X de Y
-  segmentos») y, una vez calculada, los refrescos tardan décimas. En rangos
-  grandes las IP distintas son una estimación (≈, error típico ~3 %).
-  El navegador cancela la petición anterior al cambiar de filtro y el
-  refresco automático no lanza otra si la anterior sigue en curso.
-  Opcional: `pip install orjson` acelera la lectura del histórico ~2×.
-- **Compactar segmentos** (Ajustes → Segmentos): fusiona segmentos
-  consecutivos pequeños (tras borrar por filtro, rotar a mano o cambiar la
-  rotación) hasta el estándar configurado (MB descomprimidos u horas de
-  registro). Se hace en segundo plano y es seguro ante cortes: un diario
-  (`compact.journal`) evita duplicados si se interrumpe.
-
-- **Avisos de carga**: la tabla de logs, la analítica, las reglas y Ajustes
-  muestran un "Cargando…" con spinner cuando una petición tarda más de
-  300 ms (búsquedas grandes, históricos, etc.).
-- **Borrar segmentos individuales** desde Ajustes → Segmentos (con
-  confirmación; es irreversible, no hay backups).
-- **Contador de búfer**: la píldora de cabecera y Ajustes → Estado muestran
-  cuántos logs están escritos pero aún sin volcar a disco.
-- **Refresco automático configurable**: el indicador «En vivo» de la
-  cabecera ahora es un desplegable con 4 opciones — cada 10 s, cada 30 s,
-  cada 1 min, o desactivado. Se recuerda entre sesiones (localStorage del
-  navegador). Al desactivarlo, la tabla y la analítica solo se actualizan
-  al cambiar de página/pestaña o pulsar «Actualizar»; el contador de
-  cabecera y el resto de píldoras se siguen actualizando cada 2 s aparte.
-- Pestaña **Guardado** renombrada a **Ajustes**.
-
-## Estructura del zip
-
-```
-mkanalytics/
-├── app.py
-├── requirements.txt
-├── static/
-│   ├── index.html
-│   ├── app.js
-│   └── style.css
-├── deploy/
-│   └── mkanalytics.service      # copiar a /etc/systemd/system/
-└── README.md
-```
+**Anteriores**
+- Puerto syslog por defecto **4501** (antes 4500, que choca con IPsec NAT-T):
+  actualiza `remote-port` en el router y el `ExecStart` del servicio.
+- Avisos de «Cargando…», borrar segmentos individuales, contador de búfer,
+  refresco automático configurable (10 s / 30 s / 1 min / off), pestaña
+  Guardado renombrada a Ajustes.
