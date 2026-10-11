@@ -131,6 +131,21 @@ sudo systemctl restart mkanalytics
 `data/` no está en el repositorio: actualizar no toca tus logs ni tu
 configuración.
 
+## Tests
+
+```bash
+pip install -r requirements-dev.txt
+python -m playwright install chromium   # solo para la prueba en navegador
+python -m pytest                        # o --ignore=tests/test_e2e.py para saltarla
+```
+
+Cubren el parser, el lenguaje de búsqueda y las reglas, el almacén (captura,
+rotación, compresión, borrados, importación, retención, guard de disco), el
+motor de consultas y la analítica (comparados con una implementación de
+referencia), la compactación (incluido un corte a mitad), la API HTTP, el
+receptor UDP y una prueba completa en Chromium. GitHub Actions los ejecuta en
+cada push y PR con Python 3.9–3.13.
+
 ## Cambios entre versiones
 
 Resumen; el detalle de cada versión está en

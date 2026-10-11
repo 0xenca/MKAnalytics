@@ -836,6 +836,7 @@ async function runStorageAction(act, b) {
         if (!confirm('¿Compactar los segmentos rotados? Los consecutivos pequeños se fusionan hasta el tamaño de rotación configurado. Los logs no se pierden.')) return;
         const r = await post('/api/segments/compact');
         toast(r.total ? `Compactando ${fmtN(r.segments_in)} segmentos en ${fmtN(r.total)}…` : 'No hay segmentos que compactar');
+        S.compacting = r.running;   // aunque acabe antes del próximo sondeo, al terminar se recarga la lista
         loadStorage();
       }
       else if (act === 'rotate') { const r = await post('/api/rotate'); toast('Rotado: ' + r.name); loadStorage(); }
