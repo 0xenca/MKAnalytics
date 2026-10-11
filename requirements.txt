@@ -1,3 +1,6 @@
 Flask>=3.0
-google-re2>=1.1   # regex del usuario en tiempo lineal (protege contra ReDoS)
+# regex del usuario en tiempo lineal (protege contra ReDoS); la última versión
+# con wheels para Python 3.9 es la 1.1.20250805
+google-re2>=1.1; python_version >= "3.10"
+google-re2>=1.1,<=1.1.20250805; python_version < "3.10"
 waitress>=3.0     # opcional, recomendado para producción
