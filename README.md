@@ -42,7 +42,7 @@ La configuración (ajustes, reglas, búsquedas guardadas) vive en
 
 ### 1. Instalar en el servidor
 
-Requisitos: Linux con Python 3.9+.
+Requisitos: Linux con Python 3.11+.
 
 ```bash
 git clone https://github.com/0xenca/MKAnalytics.git /opt/mkanalytics
@@ -149,7 +149,7 @@ rotación, compresión, borrados, importación, retención, guard de disco), el
 motor de consultas y la analítica (comparados con una implementación de
 referencia), la compactación (incluido un corte a mitad), la API HTTP, el
 receptor UDP y una prueba completa en Chromium. GitHub Actions los ejecuta en
-cada push y PR con Python 3.9–3.13.
+cada push y PR con Python 3.11–3.13.
 
 ## Cambios entre versiones
 
