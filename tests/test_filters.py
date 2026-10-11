@@ -91,3 +91,21 @@ def test_clean_settings():
     for bad in ({"autosave_seconds": "x"}, {"low_disk_action": "explode"}):
         with pytest.raises(ValueError):
             app.clean_settings(bad, cur)
+
+
+def test_user_regex_is_linear_time():
+    """Patrones de backtracking catastrófico (ReDoS) no bloquean: RE2 va en tiempo lineal."""
+    import time
+    evil = {"field": "raw", "op": "regex", "value": "^(a+)+$"}
+    pred = app.compile_cond(evil)
+    t = time.monotonic()
+    assert not pred({"raw": "a" * 100_000 + "!"})
+    assert time.monotonic() - t < 1.0
+    assert app.compile_filter({"q": "/(x+x+)+y/"})[0]({"raw": "x" * 50_000}) is False
+
+
+def test_user_regex_limits():
+    assert app.compile_cond({"field": "raw", "op": "regex", "value": "syn.*ACK"})({"raw": "TCP (SYN,ACK)"})
+    for bad in (r"(a)\1", r"(?<=a)b", "x" * (app.MAX_REGEX_LEN + 1)):
+        with pytest.raises(ValueError):
+            app.compile_cond({"field": "raw", "op": "regex", "value": bad})

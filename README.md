@@ -110,6 +110,11 @@ logs/s confirman que llegan datos.
   | `in=bridge state!=new` | igualdad exacta / distinto |
   | `/SYN.*ACK/` | expresión regular |
 
+  Las expresiones regulares usan RE2 (sin distinguir mayúsculas): siempre
+  tardan un tiempo proporcional al texto, así que un patrón malicioso no puede
+  colgar el servidor. No admiten referencias hacia atrás (`\1`) ni
+  lookahead/lookbehind.
+
   Las búsquedas se pueden guardar. El panel **Avanzado** permite construir
   condiciones sin escribir la sintaxis.
 - **Analítica**: línea temporal (clic en una barra para acotar), actividad por
@@ -152,6 +157,9 @@ Resumen; el detalle de cada versión está en
 [Releases](https://github.com/0xenca/MKAnalytics/releases).
 
 **Actual**
+- Seguridad: las regex de búsquedas y reglas se evalúan con RE2 (tiempo
+  lineal), corrigiendo la alerta de CodeQL «Regular expression injection»
+  (ReDoS). Nueva dependencia: `google-re2`.
 - Rendimiento con millones de logs: la tabla y la analítica ya no recorren
   todo el histórico en cada refresco. Las búsquedas largas muestran
   resultados en ≤ 3 s («≥ N coincidencias · contando…») y terminan solas;
