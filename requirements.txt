@@ -1,2 +1,3 @@
 Flask>=3.0
-waitress>=3.0   # opcional, recomendado para producción
+google-re2>=1.1   # regex del usuario en tiempo lineal (protege contra ReDoS)
+waitress>=3.0     # opcional, recomendado para producción

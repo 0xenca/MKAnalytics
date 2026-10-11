@@ -47,6 +47,7 @@ try:                       # opcional: decodifica JSON varias veces más rápido
 except ImportError:
     _loads = json.loads
 
+import re2  # google-re2: motor de regex en tiempo lineal para los patrones del usuario
 from flask import Flask, Response, jsonify, request, send_file, send_from_directory
 from werkzeug.exceptions import HTTPException
 
@@ -286,6 +287,28 @@ def _ftype(field):
     return "txt"
 
 
+MAX_REGEX_LEN = 500
+
+
+def compile_user_regex(pattern):
+    """Compila una regex escrita por el usuario (búsquedas y reglas) con RE2, que garantiza tiempo
+    lineal: ningún patrón puede provocar backtracking catastrófico (ReDoS) y bloquear la captura o
+    la web. A cambio no admite referencias hacia atrás (\\1) ni lookbehind/lookahead."""
+    if len(pattern) > MAX_REGEX_LEN:
+        raise ValueError(f"Regex demasiado larga (máximo {MAX_REGEX_LEN} caracteres)")
+    opts = re2.Options()
+    opts.case_sensitive = False
+    opts.log_errors = False
+    opts.max_mem = 8 << 20
+    try:
+        return re2.compile(pattern, opts)
+    except re2.error as ex:
+        msg = ex.args[0] if ex.args else ex
+        if isinstance(msg, bytes):
+            msg = msg.decode("utf-8", "replace")
+        raise ValueError(f"Regex inválida o no soportada: {msg}")
+
+
 def _make_test(op, val, fields):
     ftype = _ftype(fields[0])
     sval = str(val).strip()
@@ -315,10 +338,7 @@ def _make_test(op, val, fields):
     if op == "ends":
         return lambda v: v is not None and str(v).lower().endswith(low)
     if op == "regex":
-        try:
-            rx = re.compile(sval, re.I)
-        except re.error as ex:
-            raise ValueError(f"Regex inválida: {ex}")
+        rx = compile_user_regex(sval)
         return lambda v: v is not None and rx.search(str(v)) is not None
     if op in ("cidr", "in"):
         items = [x.strip() for x in re.split(r"[,\n;]+", sval) if x.strip()]
